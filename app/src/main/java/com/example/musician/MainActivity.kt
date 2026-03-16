@@ -34,8 +34,8 @@ data class Song(
 )
 
 enum class PlayMode {
+    list,
     cycle,
-    single,
     random
 }
 
@@ -65,16 +65,17 @@ class MainActivity : ComponentActivity() {
 
     var playlist by mutableStateOf(listOf<Song>())
     var playOrder by mutableStateOf(listOf<Song>())
+    var selectedUris by mutableStateOf(setOf<Uri>())
 
     var currentIndex by mutableStateOf(0)
-    var currentSongUri: Uri? = null
+    var currentSongUri: Uri? by mutableStateOf(null)
 
     var progress by mutableFloatStateOf(0f)
     var duration by mutableLongStateOf(0L)
     var position by mutableLongStateOf(0L)
     var isPlaying by mutableStateOf(false)
 
-    var playMode by mutableStateOf(PlayMode.cycle)
+    var playMode by mutableStateOf(PlayMode.list)
     var themeMode by mutableStateOf(ThemeMode.light)
 
     lateinit var prefs: android.content.SharedPreferences
@@ -161,9 +162,10 @@ class MainActivity : ComponentActivity() {
                     composable("main") {
                         MainScreen(
                             navController,
-                            playOrder,
+                            playlist,
                             currentSongUri,
                             playMode,
+                            selectedUris,
                             progress,
                             duration,
                             position,
@@ -184,8 +186,28 @@ class MainActivity : ComponentActivity() {
                                 val pos = (it * duration).toLong()
                                 player.seekTo(pos)
                             },
-                            onSelectSong = {
-                                playSong(it)
+                            onSelectSong = { uri ->
+                                if (playMode == PlayMode.cycle || (playMode == PlayMode.random && selectedUris.isNotEmpty())) {
+                                    val newSelection = selectedUris.toMutableSet()
+                                    if (newSelection.contains(uri)) {
+                                        newSelection.remove(uri)
+                                        if (newSelection.isEmpty()) {
+                                            changeMode(PlayMode.list)
+                                        } else {
+                                            selectedUris = newSelection
+                                            rebuildPlayOrder()
+                                        }
+                                    } else {
+                                        newSelection.add(uri)
+                                        selectedUris = newSelection
+                                        rebuildPlayOrder()
+                                    }
+                                } else {
+                                    val indexInOrder = playOrder.indexOfFirst { it.uri == uri }
+                                    if (indexInOrder >= 0) {
+                                        playSong(indexInOrder)
+                                    }
+                                }
                             },
                             onChangeMode = {
                                 changeMode(it)
@@ -239,25 +261,41 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun rebuildPlayOrder() {
-        playOrder =
-            if (playMode == PlayMode.random)
-                playlist.shuffled()
-            else
-                playlist
-    }
+        val baseList = if (selectedUris.isNotEmpty() && playMode != PlayMode.list) {
+            playlist.filter { it.uri in selectedUris }
+        } else {
+            playlist
+        }
 
-    private fun changeMode(mode: PlayMode) {
-        playMode = mode
+        playOrder = if (playMode == PlayMode.random) {
+            baseList.shuffled()
+        } else {
+            baseList
+        }
+
         val currentUri = currentSongUri
-        rebuildPlayOrder()
-
         if (currentUri != null) {
             val index = playOrder.indexOfFirst { it.uri == currentUri }
-            if (index >= 0) currentIndex = index
+            currentIndex = if (index >= 0) index else -1
+        } else {
+            currentIndex = 0
         }
     }
 
+    private fun changeMode(mode: PlayMode) {
+        if (mode == PlayMode.list) {
+            selectedUris = emptySet()
+        } else if (mode == PlayMode.cycle && playMode != PlayMode.cycle) {
+            if (selectedUris.isEmpty() && currentSongUri != null) {
+                selectedUris = setOf(currentSongUri!!)
+            }
+        }
+        playMode = mode
+        rebuildPlayOrder()
+    }
+
     private fun loadSong(index: Int) {
+        if (playOrder.isEmpty() || index < 0 || index >= playOrder.size) return
         val song = playOrder[index]
         player.setMediaItem(MediaItem.fromUri(song.uri))
         player.prepare()
@@ -268,6 +306,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun playSong(index: Int) {
+        if (playOrder.isEmpty() || index < 0 || index >= playOrder.size) return
         val song = playOrder[index]
         player.setMediaItem(MediaItem.fromUri(song.uri))
         player.prepare()
@@ -278,28 +317,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun nextSongManual() {
-        val next = (currentIndex + 1) % playOrder.size
+        if (playOrder.isEmpty()) return
+        val next = if (currentIndex < 0) 0 else (currentIndex + 1) % playOrder.size
         playSong(next)
     }
 
     private fun prevSongManual() {
-        val prev =
-            if (currentIndex == 0)
-                playOrder.size - 1
-            else
-                currentIndex - 1
+        if (playOrder.isEmpty()) return
+        val prev = if (currentIndex <= 0) playOrder.size - 1 else currentIndex - 1
         playSong(prev)
     }
 
     private fun nextSongAuto() {
-        when (playMode) {
-            PlayMode.single ->
-                playSong(currentIndex)
-            else -> {
-                val next = (currentIndex + 1) % playOrder.size
-                playSong(next)
-            }
-        }
+        if (playOrder.isEmpty()) return
+        val next = if (currentIndex < 0) 0 else (currentIndex + 1) % playOrder.size
+        playSong(next)
     }
 }
 
@@ -309,6 +341,7 @@ fun MainScreen(
     playlist: List<Song>,
     currentSongUri: Uri?,
     mode: PlayMode,
+    selectedUris: Set<Uri>,
     progress: Float,
     duration: Long,
     position: Long,
@@ -318,13 +351,13 @@ fun MainScreen(
     onNext: () -> Unit,
     onPrev: () -> Unit,
     onSeek: (Float) -> Unit,
-    onSelectSong: (Int) -> Unit,
+    onSelectSong: (Uri) -> Unit,
     onChangeMode: (PlayMode) -> Unit
 ) {
     val textColor = MaterialTheme.colorScheme.onBackground
     val listState = rememberLazyListState()
 
-    LaunchedEffect(currentSongUri, playlist) {
+    LaunchedEffect(currentSongUri, playlist, mode) {
         val index = playlist.indexOfFirst { it.uri == currentSongUri }
         if (index >= 0) {
             listState.animateScrollToItem(index)
@@ -393,6 +426,16 @@ fun MainScreen(
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             Button(
+                onClick = { onChangeMode(PlayMode.list) },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (mode == PlayMode.list) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                    contentColor = if (mode == PlayMode.list) MaterialTheme.colorScheme.onPrimary else textColor
+                )
+            ) {
+                Text("List")
+            }
+
+            Button(
                 onClick = { onChangeMode(PlayMode.cycle) },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (mode == PlayMode.cycle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
@@ -400,16 +443,6 @@ fun MainScreen(
                 )
             ) {
                 Text("Cycle")
-            }
-
-            Button(
-                onClick = { onChangeMode(PlayMode.single) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (mode == PlayMode.single) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                    contentColor = if (mode == PlayMode.single) MaterialTheme.colorScheme.onPrimary else textColor
-                )
-            ) {
-                Text("Single")
             }
 
             Button(
@@ -426,21 +459,24 @@ fun MainScreen(
         Spacer(Modifier.height(20.dp))
 
         LazyColumn(state = listState) {
-            itemsIndexed(playlist) { i, song ->
+            itemsIndexed(playlist) { _, song ->
                 val highlight = song.uri == currentSongUri
+                val isSelected = selectedUris.contains(song.uri)
+
+                val bgColor = when {
+                    highlight -> MaterialTheme.colorScheme.primaryContainer
+                    isSelected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                    else -> MaterialTheme.colorScheme.surface
+                }
+
                 Text(
                     song.title,
                     color = textColor,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(
-                            if (highlight)
-                                MaterialTheme.colorScheme.primaryContainer
-                            else
-                                MaterialTheme.colorScheme.surface
-                        )
+                        .background(bgColor)
                         .clickable {
-                            onSelectSong(i)
+                            onSelectSong(song.uri)
                         }
                         .padding(12.dp)
                 )
