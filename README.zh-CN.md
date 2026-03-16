@@ -6,7 +6,7 @@
 
 ## 如何下载安装
 
-+ 下载仓库内路径 `app\build\outputs\apk\debug` 下的安装文件 `app-debug.apk` 
++ 下载仓库内路径下的安装文件 `Musician.apk` 
 + 在 `Android` 或 `HarmonyOS` `NEXT` (不包括)之前的版本的手机上可以直接安装
 
 ---

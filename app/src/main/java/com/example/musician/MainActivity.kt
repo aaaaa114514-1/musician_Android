@@ -217,7 +217,10 @@ class MainActivity : ComponentActivity() {
         val dir = DocumentFile.fromTreeUri(this, uri) ?: return
 
         val songs = dir.listFiles()
-            .filter { it.name?.lowercase()?.endsWith(".mp3") == true }
+            .filter {
+                val name = it.name?.lowercase()
+                name != null && (name.endsWith(".mp3") || name.endsWith(".m4a"))
+            }
             .map {
                 Song(
                     it.uri,

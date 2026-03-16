@@ -6,7 +6,7 @@
 
 ## How to Download and Install
 
-- Download the installation file `app-debug.apk`from the repository path `app\build\outputs\apk\debug`
+- Download the installation file `Musician.apk`from the repository path
 - The app can be installed directly on devices running **Android** or **HarmonyOS** versions **before** `NEXT`(excluding `NEXT`)
 
 ---
