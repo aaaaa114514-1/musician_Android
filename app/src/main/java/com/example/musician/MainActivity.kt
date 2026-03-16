@@ -49,15 +49,17 @@ val DarkSurface = Color(0xFF1E1E1E)
 val DarkButton = Color(0xFFB0B0B0)
 val DarkButtonText = Color(0xFF000000)
 val DarkModeSelected = Color(0xFF3A3A3A)
-val DarkSliderTrack = Color(0xFFBBBBBB)
-val DarkSliderPlayed = Color(0xFFE0E0E0)
 val DarkText = Color.White
+val DarkSelectionBg = Color(0xFFb0b0b0)
+val DarkSelectionText = Color.Black
 
 val LightPrimary = Color(0xFF6750A4)
 val LightPrimaryContainer = Color(0xFFEADDFF)
 val LightBackground = Color(0xFFFFFBFE)
 val LightSurface = Color(0xFFFFFBFE)
 val LightText = Color.Black
+val LightSelectionBg = Color(0xFF6750a4)
+val LightSelectionText = Color.White
 
 class MainActivity : ComponentActivity() {
 
@@ -98,14 +100,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         player = ExoPlayer.Builder(this).build()
-
         prefs = getSharedPreferences("musician", Context.MODE_PRIVATE)
 
         val theme = prefs.getString("theme", "light")
         themeMode = if (theme == "dark") ThemeMode.dark else ThemeMode.light
 
         val folder = prefs.getString("folder", null)
-
         if (folder != null) {
             scanFolder(Uri.parse(folder))
         }
@@ -131,7 +131,6 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val navController = rememberNavController()
-
             val scheme =
                 if (themeMode == ThemeMode.dark)
                     darkColorScheme(
@@ -209,9 +208,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             },
-                            onChangeMode = {
-                                changeMode(it)
-                            }
+                            onChangeMode = { changeMode(it) }
                         )
                     }
 
@@ -225,8 +222,24 @@ class MainActivity : ComponentActivity() {
                             onPickFolder = {
                                 folderPicker.launch(null)
                             },
+                            onHelp = {
+                                navController.navigate("help") { launchSingleTop = true }
+                            },
                             onBack = {
-                                navController.popBackStack()
+                                if (navController.previousBackStackEntry != null) {
+                                    navController.popBackStack()
+                                }
+                            }
+                        )
+                    }
+
+                    composable("help") {
+                        HelpScreen(
+                            themeMode = themeMode,
+                            onBack = {
+                                if (navController.previousBackStackEntry != null) {
+                                    navController.popBackStack()
+                                }
                             }
                         )
                     }
@@ -237,7 +250,6 @@ class MainActivity : ComponentActivity() {
 
     private fun scanFolder(uri: Uri) {
         val dir = DocumentFile.fromTreeUri(this, uri) ?: return
-
         val songs = dir.listFiles()
             .filter {
                 val name = it.name?.lowercase()
@@ -378,7 +390,7 @@ fun MainScreen(
             Text("Musician", color = textColor)
             IconButton(
                 onClick = {
-                    navController.navigate("settings")
+                    navController.navigate("settings") { launchSingleTop = true }
                 }
             ) {
                 Icon(
@@ -465,13 +477,19 @@ fun MainScreen(
 
                 val bgColor = when {
                     highlight -> MaterialTheme.colorScheme.primaryContainer
-                    isSelected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                    isSelected -> if (themeMode == ThemeMode.dark) DarkSelectionBg else LightSelectionBg
                     else -> MaterialTheme.colorScheme.surface
+                }
+
+                val itemTextColor = when {
+                    highlight -> textColor
+                    isSelected -> if (themeMode == ThemeMode.dark) DarkSelectionText else LightSelectionText
+                    else -> textColor
                 }
 
                 Text(
                     song.title,
-                    color = textColor,
+                    color = itemTextColor,
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(bgColor)
@@ -490,6 +508,7 @@ fun SettingsScreen(
     themeMode: ThemeMode,
     onThemeChange: (ThemeMode) -> Unit,
     onPickFolder: () -> Unit,
+    onHelp: () -> Unit,
     onBack: () -> Unit
 ) {
     val textColor = MaterialTheme.colorScheme.onBackground
@@ -537,6 +556,85 @@ fun SettingsScreen(
         ) {
             Text("Select Music Folder")
         }
+
+        Spacer(Modifier.height(10.dp))
+
+        Button(
+            onClick = onHelp,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Help")
+        }
+    }
+}
+
+@Composable
+fun HelpScreen(
+    themeMode: ThemeMode,
+    onBack: () -> Unit
+) {
+    val textColor = MaterialTheme.colorScheme.onBackground
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(16.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "Help",
+                color = textColor,
+                style = MaterialTheme.typography.titleLarge
+            )
+            TextButton(onClick = onBack) {
+                Text("Back", color = textColor)
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        Text(
+            "Playback Modes:",
+            color = textColor,
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        Text(
+            "• List: Plays all songs in the selected folder sequentially.",
+            color = textColor,
+            style = MaterialTheme.typography.bodyMedium
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        Text(
+            "• Cycle: Multi-song cycle mode. Tap songs in the list to select or deselect them. The player will loop only through the selected songs. By default, it automatically selects the currently playing song when you enter this mode.",
+            color = textColor,
+            style = MaterialTheme.typography.bodyMedium
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        Text(
+            "• Random: Plays songs in a random order. If you switch to Random while in Cycle mode, it will randomly play only the currently selected songs.",
+            color = textColor,
+            style = MaterialTheme.typography.bodyMedium
+        )
+
+        Spacer(Modifier.height(40.dp))
+
+        Text(
+            "By aaaaa, 2026",
+            color = textColor,
+            style = MaterialTheme.typography.bodyMedium
+        )
     }
 }
 
