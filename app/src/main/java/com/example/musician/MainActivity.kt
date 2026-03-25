@@ -1,22 +1,36 @@
 package com.example.musician
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
@@ -24,42 +38,22 @@ import androidx.media3.common.*
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
+// --- 数据模型 ---
 data class Song(
     val uri: Uri,
     val title: String,
+    val artist: String = "Unknown Artist",
     val modified: Long
 )
 
-enum class PlayMode {
-    list,
-    cycle,
-    random
-}
-
-enum class ThemeMode {
-    light,
-    dark
-}
-
-val DarkBackground = Color(0xFF121212)
-val DarkSurface = Color(0xFF1E1E1E)
-val DarkButton = Color(0xFFB0B0B0)
-val DarkButtonText = Color(0xFF000000)
-val DarkModeSelected = Color(0xFF3A3A3A)
-val DarkText = Color.White
-val DarkSelectionBg = Color(0xFFb0b0b0)
-val DarkSelectionText = Color.Black
-
-val LightPrimary = Color(0xFF6750A4)
-val LightPrimaryContainer = Color(0xFFEADDFF)
-val LightBackground = Color(0xFFFFFBFE)
-val LightSurface = Color(0xFFFFFBFE)
-val LightText = Color.Black
-val LightSelectionBg = Color(0xFF6750a4)
-val LightSelectionText = Color.White
+enum class PlayMode { list, cycle }
+enum class ThemeMode { light, dark }
 
 class MainActivity : ComponentActivity() {
 
@@ -78,23 +72,21 @@ class MainActivity : ComponentActivity() {
     var isPlaying by mutableStateOf(false)
 
     var playMode by mutableStateOf(PlayMode.list)
+    var isRandom by mutableStateOf(false)
     var themeMode by mutableStateOf(ThemeMode.light)
+
+    var themeHue by mutableFloatStateOf(260f)
+    var searchQuery by mutableStateOf("")
 
     lateinit var prefs: android.content.SharedPreferences
 
-    private val folderPicker =
-        registerForActivityResult(
-            ActivityResultContracts.OpenDocumentTree()
-        ) { uri ->
-            if (uri != null) {
-                contentResolver.takePersistableUriPermission(
-                    uri,
-                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-                prefs.edit().putString("folder", uri.toString()).apply()
-                scanFolder(uri)
-            }
+    private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            prefs.edit().putString("folder", uri.toString()).apply()
+            lifecycleScope.launch { scanFolder(uri) }
         }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -102,19 +94,30 @@ class MainActivity : ComponentActivity() {
         player = ExoPlayer.Builder(this).build()
         prefs = getSharedPreferences("musician", Context.MODE_PRIVATE)
 
-        val theme = prefs.getString("theme", "light")
-        themeMode = if (theme == "dark") ThemeMode.dark else ThemeMode.light
+        themeMode = if (prefs.getString("theme", "light") == "dark") ThemeMode.dark else ThemeMode.light
+        themeHue = prefs.getFloat("hue", 260f)
 
         val folder = prefs.getString("folder", null)
         if (folder != null) {
-            scanFolder(Uri.parse(folder))
+            lifecycleScope.launch { scanFolder(Uri.parse(folder)) }
+        }
+
+        // 颜色保存防抖逻辑：避免拖动时频繁写入磁盘导致卡顿
+        lifecycleScope.launch {
+            snapshotFlow { themeHue }.collect { hue ->
+                delay(800) // 停止滑动后延迟保存
+                withContext(Dispatchers.IO) {
+                    prefs.edit().putFloat("hue", hue).apply()
+                }
+            }
         }
 
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_ENDED) {
-                    nextSongAuto()
-                }
+                if (state == Player.STATE_ENDED) nextSongAuto()
+            }
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
             }
         })
 
@@ -125,547 +128,428 @@ class MainActivity : ComponentActivity() {
                     position = player.currentPosition
                     progress = player.currentPosition.toFloat() / player.duration.toFloat()
                 }
-                delay(300)
+                delay(500)
             }
         }
 
         setContent {
-            val navController = rememberNavController()
-            val scheme =
-                if (themeMode == ThemeMode.dark)
-                    darkColorScheme(
-                        background = DarkBackground,
-                        surface = DarkSurface,
-                        onBackground = DarkText,
-                        onSurface = DarkText,
-                        primary = DarkModeSelected,
-                        onPrimary = DarkText,
-                        primaryContainer = DarkModeSelected
-                    )
-                else
-                    lightColorScheme(
-                        primary = LightPrimary,
-                        onPrimary = Color.White,
-                        primaryContainer = LightPrimaryContainer,
-                        background = LightBackground,
-                        surface = LightSurface,
-                        onBackground = LightText,
-                        onSurface = LightText
-                    )
+            val baseColor = Color.hsv(themeHue, 0.6f, 0.8f)
+            val scheme = if (themeMode == ThemeMode.dark) {
+                darkColorScheme(
+                    primary = Color.hsv(themeHue, 0.3f, 0.9f),
+                    onPrimary = Color.Black,
+                    primaryContainer = Color.hsv(themeHue, 0.4f, 0.3f),
+                    onPrimaryContainer = Color.White,
+                    background = Color(0xFF121212),
+                    surface = Color(0xFF1E1E1E),
+                    onBackground = Color(0xFFE6E1E5),
+                    onSurface = Color(0xFFE6E1E5)
+                )
+            } else {
+                lightColorScheme(
+                    primary = baseColor,
+                    onPrimary = Color.White,
+                    primaryContainer = Color.hsv(themeHue, 0.15f, 0.95f),
+                    onPrimaryContainer = Color.hsv(themeHue, 0.9f, 0.4f),
+                    background = Color(0xFFFDFBFF),
+                    surface = Color.White,
+                    onBackground = Color(0xFF1C1B1F),
+                    onSurface = Color(0xFF1C1B1F)
+                )
+            }
 
             MaterialTheme(colorScheme = scheme) {
-                NavHost(
-                    navController = navController,
-                    startDestination = "main"
-                ) {
+                val navController = rememberNavController()
+                NavHost(navController, "main") {
                     composable("main") {
                         MainScreen(
-                            navController,
-                            playlist,
-                            currentSongUri,
-                            playMode,
-                            selectedUris,
-                            progress,
-                            duration,
-                            position,
-                            isPlaying,
-                            themeMode,
-                            onPlayPause = {
-                                if (player.isPlaying) {
-                                    player.pause()
-                                    isPlaying = false
-                                } else {
-                                    player.play()
-                                    isPlaying = true
-                                }
-                            },
+                            navController, playlist, currentSongUri, playMode, isRandom, selectedUris,
+                            progress, duration, position, isPlaying, themeMode, themeHue, searchQuery,
+                            onSearchChange = { searchQuery = it },
+                            onPlayPause = { if (player.isPlaying) player.pause() else player.play() },
                             onNext = { nextSongManual() },
                             onPrev = { prevSongManual() },
-                            onSeek = {
-                                val pos = (it * duration).toLong()
-                                player.seekTo(pos)
-                            },
-                            onSelectSong = { uri ->
-                                if (playMode == PlayMode.cycle || (playMode == PlayMode.random && selectedUris.isNotEmpty())) {
-                                    val newSelection = selectedUris.toMutableSet()
-                                    if (newSelection.contains(uri)) {
-                                        newSelection.remove(uri)
-                                        if (newSelection.isEmpty()) {
-                                            changeMode(PlayMode.list)
-                                        } else {
-                                            selectedUris = newSelection
-                                            rebuildPlayOrder()
-                                        }
-                                    } else {
-                                        newSelection.add(uri)
-                                        selectedUris = newSelection
-                                        rebuildPlayOrder()
-                                    }
-                                } else {
-                                    val indexInOrder = playOrder.indexOfFirst { it.uri == uri }
-                                    if (indexInOrder >= 0) {
-                                        playSong(indexInOrder)
-                                    }
-                                }
-                            },
-                            onChangeMode = { changeMode(it) }
+                            onSeek = { player.seekTo((it * duration).toLong()) },
+                            onSelectSong = { handleSongSelection(it) },
+                            onChangeMode = { changeMode(it) },
+                            onToggleRandom = { isRandom = !isRandom; rebuildPlayOrder() }
                         )
                     }
-
                     composable("settings") {
                         SettingsScreen(
-                            themeMode = themeMode,
-                            onThemeChange = {
-                                themeMode = it
-                                prefs.edit().putString("theme", it.name).apply()
-                            },
-                            onPickFolder = {
-                                folderPicker.launch(null)
-                            },
-                            onHelp = {
-                                navController.navigate("help") { launchSingleTop = true }
-                            },
-                            onBack = {
-                                if (navController.previousBackStackEntry != null) {
-                                    navController.popBackStack()
-                                }
-                            }
+                            themeMode, themeHue,
+                            onThemeChange = { themeMode = it; prefs.edit().putString("theme", it.name).apply() },
+                            onHueChange = { themeHue = it },
+                            onPickFolder = { folderPicker.launch(null) },
+                            onHelp = { navController.navigate("help") },
+                            onBack = { navController.popBackStack() }
                         )
                     }
-
-                    composable("help") {
-                        HelpScreen(
-                            themeMode = themeMode,
-                            onBack = {
-                                if (navController.previousBackStackEntry != null) {
-                                    navController.popBackStack()
-                                }
-                            }
-                        )
-                    }
+                    composable("help") { HelpScreen { navController.popBackStack() } }
                 }
             }
         }
     }
 
-    private fun scanFolder(uri: Uri) {
-        val dir = DocumentFile.fromTreeUri(this, uri) ?: return
-        val songs = dir.listFiles()
-            .filter {
-                val name = it.name?.lowercase()
-                name != null && (name.endsWith(".mp3") || name.endsWith(".m4a"))
+    private fun handleSongSelection(uri: Uri) {
+        if (playMode == PlayMode.cycle) {
+            val newSelection = selectedUris.toMutableSet()
+            if (newSelection.contains(uri)) {
+                newSelection.remove(uri)
+                if (newSelection.isEmpty()) changeMode(PlayMode.list) else {
+                    selectedUris = newSelection
+                    rebuildPlayOrder()
+                }
+            } else {
+                newSelection.add(uri)
+                selectedUris = newSelection
+                rebuildPlayOrder()
             }
-            .map {
-                Song(
-                    it.uri,
-                    it.name ?: "Unknown",
-                    it.lastModified()
-                )
+        } else {
+            val indexInOrder = playOrder.indexOfFirst { it.uri == uri }
+            if (indexInOrder >= 0) playSong(indexInOrder)
+        }
+    }
+
+    private suspend fun scanFolder(uri: Uri) {
+        withContext(Dispatchers.IO) {
+            val dir = DocumentFile.fromTreeUri(this@MainActivity, uri) ?: return@withContext
+            val rawFiles = dir.listFiles().filter {
+                val n = it.name?.lowercase() ?: ""
+                n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".wav")
             }
-            .sortedByDescending { it.modified }
+            if (rawFiles.isEmpty()) return@withContext
 
-        playlist = songs
-        rebuildPlayOrder()
+            val fastSongs = rawFiles.map {
+                Song(it.uri, it.name?.substringBeforeLast(".") ?: "Unknown", "Loading...", it.lastModified())
+            }.sortedByDescending { it.modified }
 
-        if (playOrder.isNotEmpty()) {
-            loadSong(0)
+            withContext(Dispatchers.Main) {
+                playlist = fastSongs
+                rebuildPlayOrder()
+                if (playOrder.isNotEmpty() && currentSongUri == null) loadSong(0)
+            }
+
+            val retriever = MediaMetadataRetriever()
+            val fullSongs = rawFiles.map { file ->
+                var artist = "Unknown Artist"
+                try {
+                    retriever.setDataSource(this@MainActivity, file.uri)
+                    artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: "Unknown Artist"
+                } catch (e: Exception) {}
+                Song(file.uri, file.name?.substringBeforeLast(".") ?: "Unknown", artist, file.lastModified())
+            }.sortedByDescending { it.modified }
+            retriever.release()
+
+            withContext(Dispatchers.Main) {
+                playlist = fullSongs
+                rebuildPlayOrder()
+            }
         }
     }
 
     private fun rebuildPlayOrder() {
-        val baseList = if (selectedUris.isNotEmpty() && playMode != PlayMode.list) {
-            playlist.filter { it.uri in selectedUris }
-        } else {
-            playlist
-        }
-
-        playOrder = if (playMode == PlayMode.random) {
-            baseList.shuffled()
-        } else {
-            baseList
-        }
-
-        val currentUri = currentSongUri
-        if (currentUri != null) {
-            val index = playOrder.indexOfFirst { it.uri == currentUri }
-            currentIndex = if (index >= 0) index else -1
-        } else {
-            currentIndex = 0
-        }
+        val base = if (selectedUris.isNotEmpty() && playMode == PlayMode.cycle) playlist.filter { it.uri in selectedUris } else playlist
+        playOrder = if (isRandom) base.shuffled() else base
+        currentSongUri?.let { uri -> val idx = playOrder.indexOfFirst { it.uri == uri }; currentIndex = if (idx >= 0) idx else -1 }
     }
 
     private fun changeMode(mode: PlayMode) {
-        if (mode == PlayMode.list) {
-            selectedUris = emptySet()
-        } else if (mode == PlayMode.cycle && playMode != PlayMode.cycle) {
-            if (selectedUris.isEmpty() && currentSongUri != null) {
-                selectedUris = setOf(currentSongUri!!)
-            }
-        }
+        if (mode == PlayMode.list) selectedUris = emptySet()
+        else if (selectedUris.isEmpty() && currentSongUri != null) selectedUris = setOf(currentSongUri!!)
         playMode = mode
         rebuildPlayOrder()
     }
 
     private fun loadSong(index: Int) {
-        if (playOrder.isEmpty() || index < 0 || index >= playOrder.size) return
-        val song = playOrder[index]
-        player.setMediaItem(MediaItem.fromUri(song.uri))
+        if (playOrder.isEmpty() || index !in playOrder.indices) return
+        player.setMediaItem(MediaItem.fromUri(playOrder[index].uri))
         player.prepare()
-        player.pause()
-        currentIndex = index
-        currentSongUri = song.uri
-        isPlaying = false
+        currentIndex = index; currentSongUri = playOrder[index].uri
     }
 
     private fun playSong(index: Int) {
-        if (playOrder.isEmpty() || index < 0 || index >= playOrder.size) return
-        val song = playOrder[index]
-        player.setMediaItem(MediaItem.fromUri(song.uri))
-        player.prepare()
-        player.play()
-        currentIndex = index
-        currentSongUri = song.uri
-        isPlaying = true
+        if (playOrder.isEmpty() || index !in playOrder.indices) return
+        player.setMediaItem(MediaItem.fromUri(playOrder[index].uri))
+        player.prepare(); player.play()
+        currentIndex = index; currentSongUri = playOrder[index].uri
     }
 
-    private fun nextSongManual() {
-        if (playOrder.isEmpty()) return
-        val next = if (currentIndex < 0) 0 else (currentIndex + 1) % playOrder.size
-        playSong(next)
-    }
-
-    private fun prevSongManual() {
-        if (playOrder.isEmpty()) return
-        val prev = if (currentIndex <= 0) playOrder.size - 1 else currentIndex - 1
-        playSong(prev)
-    }
-
-    private fun nextSongAuto() {
-        if (playOrder.isEmpty()) return
-        val next = if (currentIndex < 0) 0 else (currentIndex + 1) % playOrder.size
-        playSong(next)
-    }
+    private fun nextSongManual() = playSong((currentIndex + 1) % playOrder.size)
+    private fun prevSongManual() = playSong(if (currentIndex <= 0) playOrder.size - 1 else currentIndex - 1)
+    private fun nextSongAuto() = nextSongManual()
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
-    navController: NavHostController,
-    playlist: List<Song>,
-    currentSongUri: Uri?,
-    mode: PlayMode,
-    selectedUris: Set<Uri>,
-    progress: Float,
-    duration: Long,
-    position: Long,
-    isPlaying: Boolean,
-    themeMode: ThemeMode,
-    onPlayPause: () -> Unit,
-    onNext: () -> Unit,
-    onPrev: () -> Unit,
-    onSeek: (Float) -> Unit,
-    onSelectSong: (Uri) -> Unit,
-    onChangeMode: (PlayMode) -> Unit
+    navController: NavHostController, playlist: List<Song>, currentSongUri: Uri?,
+    mode: PlayMode, isRandom: Boolean, selectedUris: Set<Uri>,
+    progress: Float, duration: Long, position: Long, isPlaying: Boolean,
+    themeMode: ThemeMode, themeHue: Float, searchQuery: String,
+    onSearchChange: (String) -> Unit, onPlayPause: () -> Unit, onNext: () -> Unit,
+    onPrev: () -> Unit, onSeek: (Float) -> Unit, onSelectSong: (Uri) -> Unit,
+    onChangeMode: (PlayMode) -> Unit, onToggleRandom: () -> Unit
 ) {
-    val textColor = MaterialTheme.colorScheme.onBackground
+    val filteredPlaylist = playlist.filter { it.title.contains(searchQuery, true) || it.artist.contains(searchQuery, true) }
     val listState = rememberLazyListState()
 
-    LaunchedEffect(currentSongUri, playlist, mode) {
-        val index = playlist.indexOfFirst { it.uri == currentSongUri }
+    var sliderDraggingValue by remember { mutableStateOf<Float?>(null) }
+
+    LaunchedEffect(currentSongUri) {
+        val index = filteredPlaylist.indexOfFirst { it.uri == currentSongUri }
         if (index >= 0) {
             listState.animateScrollToItem(index)
         }
     }
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(16.dp)
-    ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Musician", color = textColor)
-            IconButton(
-                onClick = {
-                    navController.navigate("settings") { launchSingleTop = true }
+    Scaffold(
+        topBar = {
+            Column(Modifier.background(MaterialTheme.colorScheme.background)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Musician", style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold), color = MaterialTheme.colorScheme.primary)
+                    IconButton(onClick = { navController.navigate("settings") }) { Icon(Icons.Default.Settings, null) }
                 }
-            ) {
-                Icon(
-                    Icons.Default.Settings,
-                    contentDescription = "settings",
-                    tint = textColor
+                OutlinedTextField(
+                    value = searchQuery, onValueChange = onSearchChange,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    placeholder = { Text("Search songs...") },
+                    leadingIcon = { Icon(Icons.Default.Search, null) },
+                    trailingIcon = { if(searchQuery.isNotEmpty()) IconButton(onClick = {onSearchChange("")}) {Icon(Icons.Default.Close, null)} },
+                    shape = RoundedCornerShape(12.dp), singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MaterialTheme.colorScheme.primary)
                 )
             }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Slider(
-            value = progress,
-            onValueChange = onSeek
-        )
-
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(formatTime(position), color = textColor)
-            Text(formatTime(duration), color = textColor)
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Center
-        ) {
-            ControlButton("⏮") { onPrev() }
-            Spacer(Modifier.width(24.dp))
-            ControlButton(
-                if (isPlaying) "⏸" else "▶"
-            ) { onPlayPause() }
-            Spacer(Modifier.width(24.dp))
-            ControlButton("⏭") { onNext() }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
-        ) {
-            Button(
-                onClick = { onChangeMode(PlayMode.list) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (mode == PlayMode.list) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                    contentColor = if (mode == PlayMode.list) MaterialTheme.colorScheme.onPrimary else textColor
-                )
-            ) {
-                Text("List")
-            }
-
-            Button(
-                onClick = { onChangeMode(PlayMode.cycle) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (mode == PlayMode.cycle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                    contentColor = if (mode == PlayMode.cycle) MaterialTheme.colorScheme.onPrimary else textColor
-                )
-            ) {
-                Text("Cycle")
-            }
-
-            Button(
-                onClick = { onChangeMode(PlayMode.random) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (mode == PlayMode.random) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                    contentColor = if (mode == PlayMode.random) MaterialTheme.colorScheme.onPrimary else textColor
-                )
-            ) {
-                Text("Random")
-            }
-        }
-
-        Spacer(Modifier.height(20.dp))
-
-        LazyColumn(state = listState) {
-            itemsIndexed(playlist) { _, song ->
-                val highlight = song.uri == currentSongUri
-                val isSelected = selectedUris.contains(song.uri)
-
-                val bgColor = when {
-                    highlight -> MaterialTheme.colorScheme.primaryContainer
-                    isSelected -> if (themeMode == ThemeMode.dark) DarkSelectionBg else LightSelectionBg
-                    else -> MaterialTheme.colorScheme.surface
-                }
-
-                val itemTextColor = when {
-                    highlight -> textColor
-                    isSelected -> if (themeMode == ThemeMode.dark) DarkSelectionText else LightSelectionText
-                    else -> textColor
-                }
-
-                Text(
-                    song.title,
-                    color = itemTextColor,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(bgColor)
-                        .clickable {
-                            onSelectSong(song.uri)
+        },
+        bottomBar = {
+            Surface(tonalElevation = 8.dp, shadowElevation = 12.dp, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)) {
+                Column(Modifier.padding(16.dp).fillMaxWidth()) {
+                    Slider(
+                        value = sliderDraggingValue ?: progress,
+                        onValueChange = { sliderDraggingValue = it },
+                        onValueChangeFinished = {
+                            sliderDraggingValue?.let { onSeek(it) }
+                            sliderDraggingValue = null
+                        },
+                        modifier = Modifier.height(20.dp)
+                    )
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        val displayPos = if (sliderDraggingValue != null) (sliderDraggingValue!! * duration).toLong() else position
+                        Text(formatTime(displayPos), style = MaterialTheme.typography.labelSmall)
+                        Text(formatTime(duration), style = MaterialTheme.typography.labelSmall)
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row {
+                            ModeIcon(Icons.Default.List, mode == PlayMode.list) { onChangeMode(PlayMode.list) }
+                            Spacer(Modifier.width(8.dp))
+                            ModeIcon(Icons.Default.Repeat, mode == PlayMode.cycle) { onChangeMode(PlayMode.cycle) }
                         }
-                        .padding(12.dp)
-                )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = onPrev) { Icon(Icons.Rounded.SkipPrevious, null, Modifier.size(32.dp)) }
+                            Spacer(Modifier.width(20.dp))
+                            FloatingActionButton(onClick = onPlayPause, containerColor = MaterialTheme.colorScheme.primary, shape = CircleShape) {
+                                Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null, Modifier.size(32.dp))
+                            }
+                            Spacer(Modifier.width(20.dp))
+                            IconButton(onClick = onNext) { Icon(Icons.Rounded.SkipNext, null, Modifier.size(32.dp)) }
+                        }
+                        ModeIcon(Icons.Default.Shuffle, isRandom) { onToggleRandom() }
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        Box(Modifier.padding(padding).fillMaxSize()) {
+            if (playlist.isEmpty()) {
+                Text("No music found", Modifier.align(Alignment.Center), color = MaterialTheme.colorScheme.outline)
+            } else {
+                LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
+                    items(filteredPlaylist) { song ->
+                        SongItem(song, song.uri == currentSongUri, selectedUris.contains(song.uri), themeMode, themeHue) { onSelectSong(song.uri) }
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun SettingsScreen(
-    themeMode: ThemeMode,
-    onThemeChange: (ThemeMode) -> Unit,
-    onPickFolder: () -> Unit,
-    onHelp: () -> Unit,
-    onBack: () -> Unit
-) {
-    val textColor = MaterialTheme.colorScheme.onBackground
-
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(16.dp)
-    ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Settings", color = textColor)
-            TextButton(onClick = onBack) {
-                Text("Back", color = textColor)
-            }
-        }
-
-        Spacer(Modifier.height(20.dp))
-
-        Button(
-            onClick = { onThemeChange(ThemeMode.light) },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Light Theme")
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        Button(
-            onClick = { onThemeChange(ThemeMode.dark) },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Dark Theme")
-        }
-
-        Spacer(Modifier.height(20.dp))
-
-        Button(
-            onClick = onPickFolder,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Select Music Folder")
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        Button(
-            onClick = onHelp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Help")
+fun ModeIcon(icon: ImageVector, isActive: Boolean, onClick: () -> Unit) {
+    IconButton(onClick = onClick, colors = IconButtonDefaults.iconButtonColors(contentColor = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(icon, null, modifier = Modifier.size(if (isActive) 28.dp else 24.dp))
+            if (isActive) Box(Modifier.size(4.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
         }
     }
 }
 
 @Composable
-fun HelpScreen(
-    themeMode: ThemeMode,
-    onBack: () -> Unit
-) {
-    val textColor = MaterialTheme.colorScheme.onBackground
+fun SongItem(song: Song, isCurrent: Boolean, isSelected: Boolean, themeMode: ThemeMode, themeHue: Float, onClick: () -> Unit) {
+    val bgColor = when {
+        isCurrent -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.8f)
+        isSelected -> Color.hsv(themeHue, if(themeMode == ThemeMode.dark) 0.4f else 0.2f, if(themeMode == ThemeMode.dark) 0.5f else 0.9f)
+        else -> Color.Transparent
+    }
+    val textColor = if (isSelected && themeMode == ThemeMode.dark) Color.White else MaterialTheme.colorScheme.onBackground
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(16.dp)
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).clip(RoundedCornerShape(12.dp)).background(bgColor).clickable { onClick() }.padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                "Help",
-                color = textColor,
-                style = MaterialTheme.typography.titleLarge
-            )
-            TextButton(onClick = onBack) {
-                Text("Back", color = textColor)
-            }
+        Box(Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant), Alignment.Center) {
+            Icon(if (isCurrent && !isSelected) Icons.Default.GraphicEq else Icons.Default.MusicNote, null, tint = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)
         }
-
-        Spacer(Modifier.height(24.dp))
-
-        Text(
-            "Playback Modes:",
-            color = textColor,
-            style = MaterialTheme.typography.titleMedium
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        Text(
-            "• List: Plays all songs in the selected folder sequentially.",
-            color = textColor,
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        Text(
-            "• Cycle: Multi-song cycle mode. Tap songs in the list to select or deselect them. The player will loop only through the selected songs. By default, it automatically selects the currently playing song when you enter this mode.",
-            color = textColor,
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        Text(
-            "• Random: Plays songs in a random order. If you switch to Random while in Cycle mode, it will randomly play only the currently selected songs.",
-            color = textColor,
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        Spacer(Modifier.height(40.dp))
-
-        Text(
-            "By aaaaa, 2026",
-            color = textColor,
-            style = MaterialTheme.typography.bodyMedium
-        )
+        Spacer(Modifier.width(16.dp))
+        Column(Modifier.weight(1f)) {
+            Text(song.title, color = textColor, style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(song.artist, color = if (isSelected) textColor.copy(0.7f) else MaterialTheme.colorScheme.outline, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+        }
+        if (isCurrent) Icon(Icons.Default.PlayArrow, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
     }
 }
 
 @Composable
-fun ControlButton(
-    symbol: String,
-    onClick: () -> Unit
-) {
-    Surface(
-        shape = MaterialTheme.shapes.extraLarge,
-        tonalElevation = 4.dp,
-        color = DarkButton
-    ) {
-        Box(
+fun SettingsScreen(themeMode: ThemeMode, themeHue: Float, onThemeChange: (ThemeMode) -> Unit, onHueChange: (Float) -> Unit, onPickFolder: () -> Unit, onHelp: () -> Unit, onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
+                Text("Settings", style = MaterialTheme.typography.titleLarge)
+            }
+        }
+    ) { padding ->
+        Column(Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
+            Text("Appearance", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(12.dp))
+
+            Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), tonalElevation = 2.dp) {
+                Column {
+                    Row(Modifier.fillMaxWidth().clickable { onThemeChange(ThemeMode.light) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(themeMode == ThemeMode.light, { onThemeChange(ThemeMode.light) }); Text("Light Theme")
+                    }
+                    Row(Modifier.fillMaxWidth().clickable { onThemeChange(ThemeMode.dark) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(themeMode == ThemeMode.dark, { onThemeChange(ThemeMode.dark) }); Text("Dark Theme")
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Text("Theme Palette (Hue Slider)", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(12.dp))
+
+            HueSlider(themeHue, onHueChange)
+
+            Spacer(Modifier.height(32.dp))
+            Text("Library", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = onPickFolder, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Folder, null); Spacer(Modifier.width(8.dp)); Text("Change Music Folder") }
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = onHelp, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.HelpOutline, null); Spacer(Modifier.width(8.dp)); Text("Help") }
+        }
+    }
+}
+
+@Composable
+fun HueSlider(hue: Float, onHueChange: (Float) -> Unit) {
+    // 使用局部拖动状态，确保拖动瞬间 UI 响应
+    var draggingHue by remember { mutableStateOf<Float?>(null) }
+    val displayHue = draggingHue ?: hue
+
+    Column {
+        BoxWithConstraints(
             modifier = Modifier
-                .size(56.dp)
-                .clickable { onClick() },
-            contentAlignment = Alignment.Center
+                .fillMaxWidth()
+                .height(44.dp)
+                .clip(RoundedCornerShape(22.dp))
+                .background(brush = Brush.horizontalGradient(colors = List(36) { Color.hsv(it * 10f, 0.8f, 1f) }))
+                .pointerInput(Unit) {
+                    detectTapGestures { offset ->
+                        val newHue = (offset.x / size.width).coerceIn(0f, 1f) * 360f
+                        onHueChange(newHue)
+                    }
+                }
+                .pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { offset ->
+                            draggingHue = (offset.x / size.width).coerceIn(0f, 1f) * 360f
+                        },
+                        onDragEnd = {
+                            draggingHue?.let { onHueChange(it) }
+                            draggingHue = null
+                        },
+                        onDragCancel = { draggingHue = null },
+                        onDrag = { change, _ ->
+                            change.consume() // 必须消费事件，确保手势流连续
+                            val newHue = (change.position.x / size.width).coerceIn(0f, 1f) * 360f
+                            draggingHue = newHue
+                            onHueChange(newHue) // 实时更新外部颜色预览
+                        }
+                    )
+                }
         ) {
-            Text(
-                symbol,
-                color = DarkButtonText,
-                style = MaterialTheme.typography.headlineMedium
-            )
+            val thumbWidth = 44.dp
+            // 使用 Lambda 版本的 offset 以获得最高性能（不会触发重排）
+            Box(
+                Modifier
+                    .size(thumbWidth)
+                    .offset {
+                        val xPos = (displayHue / 360f * maxWidth.toPx()) - (thumbWidth.toPx() / 2)
+                        IntOffset(xPos.roundToInt(), 0)
+                    }
+                    .background(Color.White, CircleShape)
+                    .padding(4.dp)
+            ) {
+                Box(Modifier.fillMaxSize().background(Color.hsv(displayHue, 0.8f, 1f), CircleShape))
+            }
+        }
+        Text("Slide to change theme accent", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp), color = MaterialTheme.colorScheme.outline)
+    }
+}
+
+@Composable
+fun HelpScreen(onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
+                Text("Help", style = MaterialTheme.typography.titleLarge)
+            }
+        }
+    ) { padding ->
+        Column(Modifier.padding(padding).padding(16.dp)) {
+            HelpCard("List Mode", "Sequential playback through all songs.", Icons.Default.List)
+            HelpCard("Cycle Mode", "Select multiple songs to loop them.", Icons.Default.Repeat)
+            HelpCard("Shuffle", "Randomize order within current active set.", Icons.Default.Shuffle)
+        }
+    }
+}
+
+@Composable
+fun HelpCard(title: String, desc: String, icon: ImageVector) {
+    Surface(Modifier.padding(vertical = 8.dp).fillMaxWidth(), RoundedCornerShape(12.dp), tonalElevation = 1.dp) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(16.dp))
+            Column { Text(title, fontWeight = FontWeight.Bold); Text(desc, color = MaterialTheme.colorScheme.outline) }
         }
     }
 }
 
 fun formatTime(ms: Long): String {
     val total = ms / 1000
-    val m = total / 60
-    val s = total % 60
-    return "%02d:%02d".format(m, s)
+    return "%02d:%02d".format(total / 60, total % 60)
 }
