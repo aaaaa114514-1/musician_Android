@@ -13,8 +13,11 @@
 
 ## Supported Features
 
-- Reads the local directory for `.mp3` files and adds them to the playlist
+- Reads the local directory for `.mp3` or `.m4a` files and adds them to the playlist
 - Play / Pause / Previous Track / Next Track
 - Shuffle Mode / Single Loop / List Loop
 - Dark Mode / Light Mode
 
++ DIY theme colour
+
++ Language: English / Chinese
