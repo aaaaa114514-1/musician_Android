@@ -512,7 +512,6 @@ fun HelpScreen(lang: AppLanguage, onBack: () -> Unit) {
             HelpCard(getStr("mode_list", lang), getStr("mode_list_desc", lang), Icons.Default.List)
             HelpCard(getStr("mode_cycle", lang), getStr("mode_cycle_desc", lang), Icons.Default.Repeat)
             HelpCard(getStr("mode_shuffle", lang), getStr("mode_shuffle_desc", lang), Icons.Default.Shuffle)
-            HelpCard(getStr("auto_scroll", lang), getStr("auto_scroll_desc", lang), Icons.Default.KeyboardArrowDown)
         }
     }
 }
