@@ -1,5 +1,6 @@
 package com.example.musician
 
+import android.content.ComponentName
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -8,10 +9,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
+import androidx.compose.animation.core.EaseOutQuart
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.rememberScrollState
@@ -28,25 +33,34 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.*
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaController
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionToken
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.*
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Calendar
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
-// --- 数据模型 ---
 data class Song(
     val uri: Uri,
     val title: String,
@@ -58,11 +72,10 @@ enum class PlayMode { list, cycle }
 enum class ThemeMode { light, dark }
 enum class AppLanguage { CN, EN }
 
-// --- 本地化字符串管理 ---
 fun getStr(id: String, lang: AppLanguage): String {
     val isCN = lang == AppLanguage.CN
     return when (id) {
-        "app_name" -> if (isCN) "Musician" else "Musician"
+        "app_name" -> "Musician"
         "search_hint" -> if (isCN) "搜索歌曲或艺术家..." else "Search songs or artists..."
         "no_music" -> if (isCN) "未找到音乐" else "No music found"
         "settings" -> if (isCN) "设置" else "Settings"
@@ -85,13 +98,41 @@ fun getStr(id: String, lang: AppLanguage): String {
         "mode_cycle_desc" -> if (isCN) "选择多首歌曲进行循环播放。" else "Select multiple songs to loop them."
         "mode_shuffle" -> if (isCN) "随机播放" else "Shuffle"
         "mode_shuffle_desc" -> if (isCN) "在当前播放队列中随机乱序。" else "Randomize order within current set."
+        "sleep_timer" -> if (isCN) "定时关闭" else "Sleep Timer"
+        "timer_set_time" -> if (isCN) "按时刻停止" else "At Time"
+        "timer_set_duration" -> if (isCN) "按时长停止" else "After Duration"
+        "timer_cancel" -> if (isCN) "取消定时" else "Cancel"
+        "timer_running" -> if (isCN) "将于 %s 停止播放" else "Stops at %s"
+        "timer_status" -> if (isCN) "当前计划：%s" else "Scheduled: %s"
         else -> id
+    }
+}
+
+class MusicService : MediaSessionService() {
+    private var mediaSession: MediaSession? = null
+    private lateinit var player: ExoPlayer
+
+    override fun onCreate() {
+        super.onCreate()
+        player = ExoPlayer.Builder(this).build()
+        mediaSession = MediaSession.Builder(this, player).build()
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+
+    override fun onDestroy() {
+        mediaSession?.run {
+            player.release()
+            release()
+        }
+        super.onDestroy()
     }
 }
 
 class MainActivity : ComponentActivity() {
 
-    lateinit var player: ExoPlayer
+    private var controllerFuture: ListenableFuture<MediaController>? = null
+    private var player: Player? by mutableStateOf(null)
     lateinit var prefs: android.content.SharedPreferences
 
     var playlist by mutableStateOf(listOf<Song>())
@@ -114,6 +155,8 @@ class MainActivity : ComponentActivity() {
     var showArtist by mutableStateOf(true)
     var searchQuery by mutableStateOf("")
 
+    var sleepTimerTime by mutableLongStateOf(0L)
+
     private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
             contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -124,7 +167,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        player = ExoPlayer.Builder(this).build()
         prefs = getSharedPreferences("musician", Context.MODE_PRIVATE)
 
         themeMode = if (prefs.getString("theme", "light") == "dark") ThemeMode.dark else ThemeMode.light
@@ -132,8 +174,22 @@ class MainActivity : ComponentActivity() {
         showArtist = prefs.getBoolean("show_artist", true)
         appLanguage = AppLanguage.valueOf(prefs.getString("lang", "CN")!!)
 
-        val folder = prefs.getString("folder", null)
-        if (folder != null) { lifecycleScope.launch { scanFolder(Uri.parse(folder)) } }
+        val sessionToken = SessionToken(this, ComponentName(this, MusicService::class.java))
+        controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
+        controllerFuture?.addListener({
+            val controller = controllerFuture?.get()
+            player = controller
+            controller?.addListener(object : Player.Listener {
+                override fun onIsPlayingChanged(playing: Boolean) { isPlaying = playing }
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    currentSongUri = mediaItem?.localConfiguration?.uri
+                    val idx = playOrder.indexOfFirst { it.uri == currentSongUri }
+                    if (idx >= 0) currentIndex = idx
+                }
+            })
+            val folder = prefs.getString("folder", null)
+            if (folder != null) { lifecycleScope.launch { scanFolder(Uri.parse(folder)) } }
+        }, MoreExecutors.directExecutor())
 
         lifecycleScope.launch {
             snapshotFlow { themeHue }.collect { hue ->
@@ -142,17 +198,18 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        player.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_ENDED) nextSongAuto() }
-            override fun onIsPlayingChanged(playing: Boolean) { isPlaying = playing }
-        })
-
         lifecycleScope.launch {
             while (true) {
-                if (player.duration > 0) {
-                    duration = player.duration
-                    position = player.currentPosition
-                    progress = player.currentPosition.toFloat() / player.duration.toFloat()
+                player?.let { p ->
+                    if (p.duration > 0) {
+                        duration = p.duration
+                        position = p.currentPosition
+                        progress = p.currentPosition.toFloat() / p.duration.toFloat()
+                    }
+                }
+                if (sleepTimerTime > 0 && System.currentTimeMillis() >= sleepTimerTime) {
+                    player?.pause()
+                    sleepTimerTime = 0
                 }
                 delay(500)
             }
@@ -184,17 +241,25 @@ class MainActivity : ComponentActivity() {
 
             MaterialTheme(colorScheme = scheme) {
                 val navController = rememberNavController()
-                NavHost(navController, "main") {
+                NavHost(
+                    navController = navController,
+                    startDestination = "main",
+                    modifier = Modifier.background(MaterialTheme.colorScheme.background),
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally(tween(300, easing = EaseOutQuart)) { it / 8 } },
+                    exitTransition = { fadeOut(tween(250)) + slideOutHorizontally(tween(300, easing = EaseOutQuart)) { -it / 8 } },
+                    popEnterTransition = { fadeIn(tween(250)) + slideInHorizontally(tween(300, easing = EaseOutQuart)) { -it / 8 } },
+                    popExitTransition = { fadeOut(tween(250)) + slideOutHorizontally(tween(300, easing = EaseOutQuart)) { it / 8 } }
+                ) {
                     composable("main") {
                         MainScreen(
                             navController, playlist, currentSongUri, playMode, isRandom, selectedUris,
                             progress, duration, position, isPlaying, themeMode, themeHue, searchQuery,
-                            appLanguage, showArtist,
+                            appLanguage, showArtist, sleepTimerTime,
                             onSearchChange = { searchQuery = it },
-                            onPlayPause = { if (player.isPlaying) player.pause() else player.play() },
-                            onNext = { nextSongManual() },
-                            onPrev = { prevSongManual() },
-                            onSeek = { player.seekTo((it * duration).toLong()) },
+                            onPlayPause = { player?.let { if (it.isPlaying) it.pause() else it.play() } },
+                            onNext = { player?.seekToNext() },
+                            onPrev = { player?.seekToPrevious() },
+                            onSeek = { player?.seekTo((it * duration).toLong()) },
                             onSelectSong = { handleSongSelection(it) },
                             onChangeMode = { changeMode(it) },
                             onToggleRandom = { isRandom = !isRandom; rebuildPlayOrder() }
@@ -202,20 +267,26 @@ class MainActivity : ComponentActivity() {
                     }
                     composable("settings") {
                         SettingsScreen(
-                            themeMode, themeHue, appLanguage, showArtist,
+                            themeMode, themeHue, appLanguage, showArtist, sleepTimerTime,
                             onThemeChange = { themeMode = it; prefs.edit().putString("theme", it.name).apply() },
                             onHueChange = { themeHue = it },
                             onLangChange = { appLanguage = it; prefs.edit().putString("lang", it.name).apply() },
                             onShowArtistChange = { showArtist = it; prefs.edit().putBoolean("show_artist", it).apply() },
                             onPickFolder = { folderPicker.launch(null) },
                             onHelp = { navController.navigate("help") },
-                            onBack = { navController.popBackStack() }
+                            onBack = { navController.popBackStack() },
+                            onSetTimer = { sleepTimerTime = it }
                         )
                     }
                     composable("help") { HelpScreen(appLanguage) { navController.popBackStack() } }
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        controllerFuture?.let { MediaController.releaseFuture(it) }
+        super.onDestroy()
     }
 
     private fun handleSongSelection(uri: Uri) {
@@ -237,7 +308,10 @@ class MainActivity : ComponentActivity() {
             val files = dir.listFiles().filter { it.name?.lowercase()?.let { n -> n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".wav") } == true }
             if (files.isEmpty()) return@withContext
             val fast = files.map { Song(it.uri, it.name?.substringBeforeLast(".") ?: "Unknown", "...", it.lastModified()) }.sortedByDescending { it.modified }
-            withContext(Dispatchers.Main) { playlist = fast; rebuildPlayOrder(); if (currentSongUri == null) loadSong(0) }
+            withContext(Dispatchers.Main) {
+                playlist = fast; rebuildPlayOrder()
+                if (currentSongUri == null && playOrder.isNotEmpty()) loadSong(0)
+            }
             val retriever = MediaMetadataRetriever()
             val full = files.map { f ->
                 var a = "Unknown Artist"
@@ -251,8 +325,39 @@ class MainActivity : ComponentActivity() {
 
     private fun rebuildPlayOrder() {
         val base = if (selectedUris.isNotEmpty() && playMode == PlayMode.cycle) playlist.filter { it.uri in selectedUris } else playlist
-        playOrder = if (isRandom) base.shuffled() else base
-        currentSongUri?.let { uri -> val idx = playOrder.indexOfFirst { it.uri == uri }; currentIndex = if (idx >= 0) idx else -1 }
+        if (base.isEmpty()) return
+
+        val activeUri = currentSongUri ?: playOrder.getOrNull(currentIndex)?.uri
+
+        if (isRandom) {
+            val current = base.find { it.uri == activeUri }
+            val others = base.filter { it.uri != activeUri }.shuffled()
+            playOrder = if (current != null) listOf(current) + others else others
+            currentIndex = if (current != null) 0 else -1
+        } else {
+            playOrder = base
+            val idx = playOrder.indexOfFirst { it.uri == activeUri }
+            currentIndex = if (idx >= 0) idx else 0
+        }
+
+        syncPlayerQueue()
+    }
+
+    private fun syncPlayerQueue() {
+        player?.let { p ->
+            val mediaItems = playOrder.map { song ->
+                MediaItem.Builder()
+                    .setUri(song.uri)
+                    .setMediaId(song.uri.toString())
+                    .setMediaMetadata(MediaMetadata.Builder().setTitle(song.title).setArtist(song.artist).build())
+                    .build()
+            }
+
+            val lastPos = p.currentPosition
+            p.setMediaItems(mediaItems, currentIndex, lastPos)
+            p.repeatMode = if (playMode == PlayMode.cycle) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+            if (p.playbackState == Player.STATE_IDLE) p.prepare()
+        }
     }
 
     private fun changeMode(mode: PlayMode) {
@@ -261,11 +366,22 @@ class MainActivity : ComponentActivity() {
         playMode = mode; rebuildPlayOrder()
     }
 
-    private fun loadSong(idx: Int) { if (idx in playOrder.indices) { player.setMediaItem(MediaItem.fromUri(playOrder[idx].uri)); player.prepare(); currentIndex = idx; currentSongUri = playOrder[idx].uri } }
-    private fun playSong(idx: Int) { if (idx in playOrder.indices) { player.setMediaItem(MediaItem.fromUri(playOrder[idx].uri)); player.prepare(); player.play(); currentIndex = idx; currentSongUri = playOrder[idx].uri } }
-    private fun nextSongManual() = if(playOrder.isNotEmpty()) playSong((currentIndex + 1) % playOrder.size) else Unit
-    private fun prevSongManual() = if(playOrder.isNotEmpty()) playSong(if (currentIndex <= 0) playOrder.size - 1 else currentIndex - 1) else Unit
-    private fun nextSongAuto() = nextSongManual()
+    private fun loadSong(idx: Int) {
+        if (idx in playOrder.indices) {
+            currentIndex = idx
+            currentSongUri = playOrder[idx].uri
+            player?.seekTo(idx, 0)
+        }
+    }
+
+    private fun playSong(idx: Int) {
+        if (idx in playOrder.indices) {
+            currentIndex = idx
+            currentSongUri = playOrder[idx].uri
+            player?.seekTo(idx, 0)
+            player?.play()
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -275,7 +391,7 @@ fun MainScreen(
     mode: PlayMode, isRandom: Boolean, selectedUris: Set<Uri>,
     progress: Float, duration: Long, position: Long, isPlaying: Boolean,
     themeMode: ThemeMode, themeHue: Float, searchQuery: String,
-    lang: AppLanguage, showArtist: Boolean,
+    lang: AppLanguage, showArtist: Boolean, sleepTimerTime: Long,
     onSearchChange: (String) -> Unit, onPlayPause: () -> Unit, onNext: () -> Unit,
     onPrev: () -> Unit, onSeek: (Float) -> Unit, onSelectSong: (Uri) -> Unit,
     onChangeMode: (PlayMode) -> Unit, onToggleRandom: () -> Unit
@@ -300,6 +416,21 @@ fun MainScreen(
                     Text(getStr("app_name", lang), style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold), color = MaterialTheme.colorScheme.primary)
                     IconButton(onClick = { navController.navigate("settings") }) { Icon(Icons.Default.Settings, null) }
                 }
+
+                AnimatedVisibility(visible = sleepTimerTime > 0, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp, 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Timer, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(8.dp))
+                            Text(getStr("timer_running", lang).format(formatClockTime(sleepTimerTime)), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = searchQuery, onValueChange = onSearchChange,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -355,7 +486,7 @@ fun MainScreen(
                 Text(getStr("no_music", lang), Modifier.align(Alignment.Center), color = MaterialTheme.colorScheme.outline)
             } else {
                 LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
-                    items(filtered) { song ->
+                    items(filtered, key = { it.uri.toString() }) { song ->
                         SongItem(song, song.uri == currentSongUri, selectedUris.contains(song.uri), themeMode, themeHue, showArtist) { onSelectSong(song.uri) }
                     }
                 }
@@ -403,11 +534,15 @@ fun SongItem(song: Song, isCurrent: Boolean, isSelected: Boolean, themeMode: The
 
 @Composable
 fun SettingsScreen(
-    themeMode: ThemeMode, themeHue: Float, lang: AppLanguage, showArtist: Boolean,
+    themeMode: ThemeMode, themeHue: Float, lang: AppLanguage, showArtist: Boolean, sleepTimerTime: Long,
     onThemeChange: (ThemeMode) -> Unit, onHueChange: (Float) -> Unit,
     onLangChange: (AppLanguage) -> Unit, onShowArtistChange: (Boolean) -> Unit,
-    onPickFolder: () -> Unit, onHelp: () -> Unit, onBack: () -> Unit
+    onPickFolder: () -> Unit, onHelp: () -> Unit, onBack: () -> Unit,
+    onSetTimer: (Long) -> Unit
 ) {
+    var selectedHour by remember { mutableIntStateOf(0) }
+    var selectedMin by remember { mutableIntStateOf(30) }
+
     Scaffold(
         topBar = {
             Row(
@@ -422,6 +557,59 @@ fun SettingsScreen(
         Column(
             modifier = Modifier.padding(padding).padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())
         ) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                Text(getStr("sleep_timer", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                if (sleepTimerTime > 0) {
+                    Text(getStr("timer_status", lang).format(formatClockTime(sleepTimerTime)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Surface(Modifier.fillMaxWidth(), RoundedCornerShape(24.dp), tonalElevation = 4.dp) {
+                Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Row(
+                        modifier = Modifier.height(160.dp).fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        WheelPicker(count = 24, initialValue = selectedHour, onValueChange = { selectedHour = it })
+                        Text(":", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(horizontal = 8.dp))
+                        WheelPicker(count = 60, initialValue = selectedMin, onValueChange = { selectedMin = it })
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Button(
+                            onClick = {
+                                val now = Calendar.getInstance()
+                                val target = Calendar.getInstance().apply {
+                                    set(Calendar.HOUR_OF_DAY, selectedHour)
+                                    set(Calendar.MINUTE, selectedMin)
+                                    set(Calendar.SECOND, 0)
+                                }
+                                if (target.before(now)) target.add(Calendar.DAY_OF_YEAR, 1)
+                                onSetTimer(target.timeInMillis)
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp)
+                        ) { Text(getStr("timer_set_time", lang), style = MaterialTheme.typography.labelSmall) }
+
+                        Button(
+                            onClick = {
+                                val target = System.currentTimeMillis() + (selectedHour.toLong() * 3600000L) + (selectedMin.toLong() * 60000L)
+                                onSetTimer(target)
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp)
+                        ) { Text(getStr("timer_set_duration", lang), style = MaterialTheme.typography.labelSmall) }
+                    }
+                    if (sleepTimerTime > 0) {
+                        TextButton(onClick = { onSetTimer(0L) }) {
+                            Text(getStr("timer_cancel", lang), color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
             Text(getStr("appearance", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
             Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), tonalElevation = 2.dp) {
@@ -460,6 +648,63 @@ fun SettingsScreen(
             Button(onClick = onPickFolder, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Folder, null); Spacer(Modifier.width(8.dp)); Text(getStr("change_folder", lang)) }
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = onHelp, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.HelpOutline, null); Spacer(Modifier.width(8.dp)); Text(getStr("help", lang)) }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun WheelPicker(count: Int, initialValue: Int, onValueChange: (Int) -> Unit) {
+    val itemHeight = 48.dp
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = Int.MAX_VALUE / 2 - (Int.MAX_VALUE / 2 % count) + initialValue - 1)
+    val flingBehavior = rememberSnapFlingBehavior(lazyListState = listState)
+
+    LaunchedEffect(listState.isScrollInProgress) {
+        if (!listState.isScrollInProgress) {
+            val centerIndex = listState.firstVisibleItemIndex + 1
+            onValueChange(centerIndex % count)
+        }
+    }
+
+    Box(modifier = Modifier.width(80.dp).height(itemHeight * 3), contentAlignment = Alignment.Center) {
+        Box(modifier = Modifier.fillMaxWidth().height(itemHeight).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(12.dp)))
+        LazyColumn(
+            state = listState,
+            flingBehavior = flingBehavior,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(vertical = 0.dp)
+        ) {
+            items(Int.MAX_VALUE) { index ->
+                val value = index % count
+                val offset = remember { derivedStateOf {
+                    val layoutInfo = listState.layoutInfo
+                    val visibleItem = layoutInfo.visibleItemsInfo.find { it.index == index }
+                    if (visibleItem != null) {
+                        val viewCenter = layoutInfo.viewportEndOffset / 2f
+                        val itemCenter = visibleItem.offset + visibleItem.size / 2f
+                        abs(viewCenter - itemCenter) / (layoutInfo.viewportEndOffset / 2f)
+                    } else 1f
+                }}.value
+
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(itemHeight).graphicsLayer {
+                        alpha = 1f - (offset * 0.6f).coerceIn(0f, 0.7f)
+                        scaleX = 1f - (offset * 0.3f).coerceIn(0f, 0.3f)
+                        scaleY = 1f - (offset * 0.3f).coerceIn(0f, 0.3f)
+                        rotationX = offset * 45f
+                    },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "%02d".format(value),
+                        style = MaterialTheme.typography.headlineSmall.copy(
+                            fontWeight = if (offset < 0.2f) FontWeight.Bold else FontWeight.Normal,
+                            fontSize = if (offset < 0.2f) 28.sp else 22.sp
+                        ),
+                        color = if (offset < 0.2f) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
         }
     }
 }
@@ -530,4 +775,9 @@ fun HelpCard(title: String, desc: String, icon: ImageVector) {
 fun formatTime(ms: Long): String {
     val total = ms / 1000
     return "%02d:%02d".format(total / 60, total % 60)
+}
+
+fun formatClockTime(ms: Long): String {
+    val cal = Calendar.getInstance().apply { timeInMillis = ms }
+    return "%02d:%02d".format(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))
 }
