@@ -2,6 +2,7 @@ package com.example.musician
 
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
@@ -20,9 +21,9 @@ import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.rounded.*
@@ -57,10 +58,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONArray
 import java.util.Calendar
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+// ---------- 数据类与枚举 ----------
 data class Song(
     val uri: Uri,
     val title: String,
@@ -72,6 +77,7 @@ enum class PlayMode { list, cycle }
 enum class ThemeMode { light, dark }
 enum class AppLanguage { CN, EN }
 
+// ---------- 字符串资源 ----------
 fun getStr(id: String, lang: AppLanguage): String {
     val isCN = lang == AppLanguage.CN
     return when (id) {
@@ -90,6 +96,14 @@ fun getStr(id: String, lang: AppLanguage): String {
         "hue_hint" -> if (isCN) "滑动以改变主题颜色" else "Slide to change theme accent"
         "library" -> if (isCN) "媒体库" else "Library"
         "change_folder" -> if (isCN) "更改音乐文件夹" else "Change Music Folder"
+        "sync" -> if (isCN) "从电脑同步歌曲" else "Sync from PC"
+        "sync_button" -> if (isCN) "开始同步" else "Start Sync"
+        "sync_no_folder" -> if (isCN) "请先选择音乐文件夹" else "Please select a music folder first"
+        "sync_connecting" -> if (isCN) "正在连接服务器..." else "Connecting to server..."
+        "sync_downloading" -> if (isCN) "正在下载: %s" else "Downloading: %s"
+        "sync_exists" -> if (isCN) "已存在: %s，跳过" else "Already exists: %s, skipped"
+        "sync_done" -> if (isCN) "同步完成！共 %d 首" else "Sync complete! %d songs"
+        "sync_failed" -> if (isCN) "同步失败: %s" else "Sync failed: %s"
         "help" -> if (isCN) "帮助" else "Help"
         "back" -> if (isCN) "返回" else "Back"
         "mode_list" -> if (isCN) "列表模式" else "List Mode"
@@ -108,14 +122,49 @@ fun getStr(id: String, lang: AppLanguage): String {
     }
 }
 
+// ---------- 音乐服务 ----------
 class MusicService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
     private lateinit var player: ExoPlayer
 
     override fun onCreate() {
         super.onCreate()
+
+        // 创建通知渠道（Android 8.0+ 必需）
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                "music_playback",
+                "Music Playback",
+                android.app.NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(android.app.NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+
         player = ExoPlayer.Builder(this).build()
         mediaSession = MediaSession.Builder(this, player).build()
+
+        // 构建一个简单通知并立即调用 startForeground
+        val notification = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            android.app.Notification.Builder(this, "music_playback")
+                .setContentTitle("Musician")
+                .setContentText("Playing")
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            android.app.Notification.Builder(this)
+                .setContentTitle("Musician")
+                .setContentText("Playing")
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .build()
+        }
+        startForeground(1001, notification)
+    }
+
+    // 必须实现的抽象方法，可留空
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        // 可在此更新通知内容，暂不处理
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
@@ -129,6 +178,7 @@ class MusicService : MediaSessionService() {
     }
 }
 
+// ---------- 主 Activity ----------
 class MainActivity : ComponentActivity() {
 
     private var controllerFuture: ListenableFuture<MediaController>? = null
@@ -157,9 +207,17 @@ class MainActivity : ComponentActivity() {
 
     var sleepTimerTime by mutableLongStateOf(0L)
 
+    // 同步状态
+    var syncStatus by mutableStateOf<String?>(null)
+    var isSyncing by mutableStateOf(false)
+
+    private val serverUrl = "http://192.168.137.1:5000"
+    private val client = OkHttpClient()
+
+    // 文件夹选择器
     private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
-            contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
             prefs.edit().putString("folder", uri.toString()).apply()
             lifecycleScope.launch { scanFolder(uri) }
         }
@@ -174,6 +232,7 @@ class MainActivity : ComponentActivity() {
         showArtist = prefs.getBoolean("show_artist", true)
         appLanguage = AppLanguage.valueOf(prefs.getString("lang", "CN")!!)
 
+        // 连接媒体服务
         val sessionToken = SessionToken(this, ComponentName(this, MusicService::class.java))
         controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
         controllerFuture?.addListener({
@@ -191,6 +250,7 @@ class MainActivity : ComponentActivity() {
             if (folder != null) { lifecycleScope.launch { scanFolder(Uri.parse(folder)) } }
         }, MoreExecutors.directExecutor())
 
+        // 保存主题色
         lifecycleScope.launch {
             snapshotFlow { themeHue }.collect { hue ->
                 delay(800)
@@ -198,6 +258,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // 更新进度和定时器
         lifecycleScope.launch {
             while (true) {
                 player?.let { p ->
@@ -268,11 +329,14 @@ class MainActivity : ComponentActivity() {
                     composable("settings") {
                         SettingsScreen(
                             themeMode, themeHue, appLanguage, showArtist, sleepTimerTime,
+                            syncStatus = syncStatus,
+                            isSyncing = isSyncing,
                             onThemeChange = { themeMode = it; prefs.edit().putString("theme", it.name).apply() },
                             onHueChange = { themeHue = it },
                             onLangChange = { appLanguage = it; prefs.edit().putString("lang", it.name).apply() },
                             onShowArtistChange = { showArtist = it; prefs.edit().putBoolean("show_artist", it).apply() },
                             onPickFolder = { folderPicker.launch(null) },
+                            onSync = { startSync() },
                             onHelp = { navController.navigate("help") },
                             onBack = { navController.popBackStack() },
                             onSetTimer = { sleepTimerTime = it }
@@ -289,6 +353,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    // ====== 媒体控制 ======
     private fun handleSongSelection(uri: Uri) {
         if (playMode == PlayMode.cycle) {
             val newSelection = selectedUris.toMutableSet()
@@ -305,8 +370,12 @@ class MainActivity : ComponentActivity() {
     private suspend fun scanFolder(uri: Uri) {
         withContext(Dispatchers.IO) {
             val dir = DocumentFile.fromTreeUri(this@MainActivity, uri) ?: return@withContext
-            val files = dir.listFiles().filter { it.name?.lowercase()?.let { n -> n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".wav") } == true }
-            if (files.isEmpty()) return@withContext
+            val files = dir.listFiles().filter { it.name?.lowercase()
+                ?.let { n -> n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".wav") } == true }
+            if (files.isEmpty()) {
+                withContext(Dispatchers.Main) { playlist = emptyList(); rebuildPlayOrder() }
+                return@withContext
+            }
             val fast = files.map { Song(it.uri, it.name?.substringBeforeLast(".") ?: "Unknown", "...", it.lastModified()) }.sortedByDescending { it.modified }
             withContext(Dispatchers.Main) {
                 playlist = fast; rebuildPlayOrder()
@@ -315,7 +384,10 @@ class MainActivity : ComponentActivity() {
             val retriever = MediaMetadataRetriever()
             val full = files.map { f ->
                 var a = "Unknown Artist"
-                try { retriever.setDataSource(this@MainActivity, f.uri); a = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: "Unknown Artist" } catch (e: Exception) {}
+                try {
+                    retriever.setDataSource(this@MainActivity, f.uri)
+                    a = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: "Unknown Artist"
+                } catch (_: Exception) {}
                 Song(f.uri, f.name?.substringBeforeLast(".") ?: "Unknown", a, f.lastModified())
             }.sortedByDescending { it.modified }
             retriever.release()
@@ -325,7 +397,11 @@ class MainActivity : ComponentActivity() {
 
     private fun rebuildPlayOrder() {
         val base = if (selectedUris.isNotEmpty() && playMode == PlayMode.cycle) playlist.filter { it.uri in selectedUris } else playlist
-        if (base.isEmpty()) return
+        if (base.isEmpty()) {
+            playOrder = emptyList()
+            player?.clearMediaItems()
+            return
+        }
 
         val activeUri = currentSongUri ?: playOrder.getOrNull(currentIndex)?.uri
 
@@ -345,16 +421,29 @@ class MainActivity : ComponentActivity() {
 
     private fun syncPlayerQueue() {
         player?.let { p ->
+            if (playOrder.isEmpty()) {
+                p.clearMediaItems()
+                return
+            }
+            // 修正索引
+            if (currentIndex < 0 || currentIndex >= playOrder.size) {
+                currentIndex = 0
+            }
             val mediaItems = playOrder.map { song ->
                 MediaItem.Builder()
                     .setUri(song.uri)
                     .setMediaId(song.uri.toString())
-                    .setMediaMetadata(MediaMetadata.Builder().setTitle(song.title).setArtist(song.artist).build())
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setTitle(song.title)
+                            .setArtist(song.artist)
+                            .build()
+                    )
                     .build()
             }
-
+            val startIndex = currentIndex.coerceIn(0, playOrder.size - 1)
             val lastPos = p.currentPosition
-            p.setMediaItems(mediaItems, currentIndex, lastPos)
+            p.setMediaItems(mediaItems, startIndex, lastPos)
             p.repeatMode = if (playMode == PlayMode.cycle) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
             if (p.playbackState == Player.STATE_IDLE) p.prepare()
         }
@@ -367,34 +456,137 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadSong(idx: Int) {
-        if (idx in playOrder.indices) {
-            currentIndex = idx
-            currentSongUri = playOrder[idx].uri
-            player?.seekTo(idx, 0)
+        if (playOrder.isEmpty() || idx < 0 || idx >= playOrder.size) return
+        currentIndex = idx
+        currentSongUri = playOrder[idx].uri
+        player?.let { p ->
+            if (p.playbackState == Player.STATE_IDLE) p.prepare()
+            p.seekTo(idx, 0)
         }
     }
 
     private fun playSong(idx: Int) {
-        if (idx in playOrder.indices) {
-            currentIndex = idx
-            currentSongUri = playOrder[idx].uri
-            player?.seekTo(idx, 0)
-            player?.play()
+        if (playOrder.isEmpty() || idx < 0 || idx >= playOrder.size) return
+        currentIndex = idx
+        currentSongUri = playOrder[idx].uri
+        player?.let { p ->
+            if (p.playbackState == Player.STATE_IDLE) p.prepare()
+            p.seekTo(idx, 0)
+            p.playWhenReady = true
         }
     }
+
+    // ====== 同步功能（彻底修正） ======
+    private fun startSync() {
+        val folderUriStr = prefs.getString("folder", null)
+        if (folderUriStr == null) {
+            syncStatus = getStr("sync_no_folder", appLanguage)
+            return
+        }
+        if (isSyncing) return
+
+        isSyncing = true
+        syncStatus = getStr("sync_connecting", appLanguage)
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val folderUri = Uri.parse(folderUriStr)
+                performSync(folderUri) { status ->
+                    withContext(Dispatchers.Main) {
+                        syncStatus = status
+                    }
+                }
+                // 下面这一行就是原来的第 445 行，必须写在 launch 内部
+                scanFolder(folderUri)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    syncStatus = getStr("sync_failed", appLanguage).format(e.localizedMessage ?: "未知错误")
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    isSyncing = false
+                }
+            }
+        }
+    }
+
+    private suspend fun performSync(folderUri: Uri, onUpdate: suspend (String) -> Unit) {
+        val dirDoc = DocumentFile.fromTreeUri(this@MainActivity, folderUri)
+            ?: throw Exception("无法访问文件夹")
+
+        val listRequest = Request.Builder().url("$serverUrl/list").build()
+        val response = withContext(Dispatchers.IO) { client.newCall(listRequest).execute() }
+        if (!response.isSuccessful) throw Exception("服务器响应失败: ${response.code}")
+
+        val json = JSONArray(response.body?.string() ?: "")
+        var count = 0
+
+        for (i in 0 until json.length()) {
+            val item = json.getJSONObject(i)
+            val name = item.getString("name")
+            val relPath = item.getString("rel_path")
+
+            val existing = dirDoc.findFile(name)
+            if (existing != null && existing.exists()) {
+                onUpdate(getStr("sync_exists", appLanguage).format(name))
+                continue
+            }
+
+            val mimeType = when {
+                name.endsWith(".mp3") -> "audio/mpeg"
+                name.endsWith(".m4a") -> "audio/mp4"
+                name.endsWith(".wav") -> "audio/wav"
+                else -> "audio/*"
+            }
+            val fileDoc = dirDoc.createFile(mimeType, name)
+                ?: throw Exception("无法创建文件: $name")
+
+            onUpdate(getStr("sync_downloading", appLanguage).format(name))
+            val downloadRequest = Request.Builder().url("$serverUrl/download/$relPath").build()
+            val downloadResponse = withContext(Dispatchers.IO) { client.newCall(downloadRequest).execute() }
+            if (!downloadResponse.isSuccessful) throw Exception("下载失败: ${downloadResponse.code}")
+
+            downloadResponse.body?.byteStream()?.use { input ->
+                contentResolver.openOutputStream(fileDoc.uri)?.use { output ->
+                    input.copyTo(output)
+                    output.flush()
+                }
+            }
+            count++
+        }
+        onUpdate(getStr("sync_done", appLanguage).format(json.length()))
+    }
 }
+
+// ========== UI 组件（无变动） ==========
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
-    navController: NavHostController, playlist: List<Song>, currentSongUri: Uri?,
-    mode: PlayMode, isRandom: Boolean, selectedUris: Set<Uri>,
-    progress: Float, duration: Long, position: Long, isPlaying: Boolean,
-    themeMode: ThemeMode, themeHue: Float, searchQuery: String,
-    lang: AppLanguage, showArtist: Boolean, sleepTimerTime: Long,
-    onSearchChange: (String) -> Unit, onPlayPause: () -> Unit, onNext: () -> Unit,
-    onPrev: () -> Unit, onSeek: (Float) -> Unit, onSelectSong: (Uri) -> Unit,
-    onChangeMode: (PlayMode) -> Unit, onToggleRandom: () -> Unit
+    navController: NavHostController,
+    playlist: List<Song>,
+    currentSongUri: Uri?,
+    mode: PlayMode,
+    isRandom: Boolean,
+    selectedUris: Set<Uri>,
+    progress: Float,
+    duration: Long,
+    position: Long,
+    isPlaying: Boolean,
+    themeMode: ThemeMode,
+    themeHue: Float,
+    searchQuery: String,
+    lang: AppLanguage,
+    showArtist: Boolean,
+    sleepTimerTime: Long,
+    onSearchChange: (String) -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onPrev: () -> Unit,
+    onSeek: (Float) -> Unit,
+    onSelectSong: (Uri) -> Unit,
+    onChangeMode: (PlayMode) -> Unit,
+    onToggleRandom: () -> Unit
 ) {
     val filtered = playlist.filter { it.title.contains(searchQuery, true) || it.artist.contains(searchQuery, true) }
     val listState = rememberLazyListState()
@@ -413,8 +605,14 @@ fun MainScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(getStr("app_name", lang), style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold), color = MaterialTheme.colorScheme.primary)
-                    IconButton(onClick = { navController.navigate("settings") }) { Icon(Icons.Default.Settings, null) }
+                    Text(
+                        getStr("app_name", lang),
+                        style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    IconButton(onClick = { navController.navigate("settings") }) {
+                        Icon(Icons.Default.Settings, null)
+                    }
                 }
 
                 AnimatedVisibility(visible = sleepTimerTime > 0, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
@@ -426,29 +624,48 @@ fun MainScreen(
                         Row(modifier = Modifier.padding(12.dp, 8.dp), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Timer, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                             Spacer(Modifier.width(8.dp))
-                            Text(getStr("timer_running", lang).format(formatClockTime(sleepTimerTime)), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                            Text(
+                                getStr("timer_running", lang).format(formatClockTime(sleepTimerTime)),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
 
                 OutlinedTextField(
-                    value = searchQuery, onValueChange = onSearchChange,
+                    value = searchQuery,
+                    onValueChange = onSearchChange,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                     placeholder = { Text(getStr("search_hint", lang)) },
                     leadingIcon = { Icon(Icons.Default.Search, null) },
-                    trailingIcon = { if(searchQuery.isNotEmpty()) IconButton(onClick = {onSearchChange("")}) {Icon(Icons.Default.Close, null)} },
-                    shape = RoundedCornerShape(12.dp), singleLine = true,
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { onSearchChange("") }) { Icon(Icons.Default.Close, null) }
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MaterialTheme.colorScheme.primary)
                 )
             }
         },
         bottomBar = {
-            Surface(tonalElevation = 8.dp, shadowElevation = 12.dp, color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)) {
+            Surface(
+                tonalElevation = 8.dp,
+                shadowElevation = 12.dp,
+                color = MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+            ) {
                 Column(Modifier.padding(16.dp).fillMaxWidth()) {
                     Slider(
                         value = sliderDraggingValue ?: progress,
                         onValueChange = { sliderDraggingValue = it },
-                        onValueChangeFinished = { sliderDraggingValue?.let { onSeek(it) }; sliderDraggingValue = null },
+                        onValueChangeFinished = {
+                            sliderDraggingValue?.let { onSeek(it) }
+                            sliderDraggingValue = null
+                        },
                         modifier = Modifier.height(20.dp)
                     )
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -469,8 +686,16 @@ fun MainScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             IconButton(onClick = onPrev) { Icon(Icons.Rounded.SkipPrevious, null, Modifier.size(32.dp)) }
                             Spacer(Modifier.width(20.dp))
-                            FloatingActionButton(onClick = onPlayPause, containerColor = MaterialTheme.colorScheme.primary, shape = CircleShape) {
-                                Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null, Modifier.size(32.dp))
+                            FloatingActionButton(
+                                onClick = onPlayPause,
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                shape = CircleShape
+                            ) {
+                                Icon(
+                                    if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                    null,
+                                    Modifier.size(32.dp)
+                                )
                             }
                             Spacer(Modifier.width(20.dp))
                             IconButton(onClick = onNext) { Icon(Icons.Rounded.SkipNext, null, Modifier.size(32.dp)) }
@@ -487,7 +712,14 @@ fun MainScreen(
             } else {
                 LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
                     items(filtered, key = { it.uri.toString() }) { song ->
-                        SongItem(song, song.uri == currentSongUri, selectedUris.contains(song.uri), themeMode, themeHue, showArtist) { onSelectSong(song.uri) }
+                        SongItem(
+                            song,
+                            song.uri == currentSongUri,
+                            selectedUris.contains(song.uri),
+                            themeMode,
+                            themeHue,
+                            showArtist
+                        ) { onSelectSong(song.uri) }
                     }
                 }
             }
@@ -497,7 +729,12 @@ fun MainScreen(
 
 @Composable
 fun ModeIcon(icon: ImageVector, isActive: Boolean, onClick: () -> Unit) {
-    IconButton(onClick = onClick, colors = IconButtonDefaults.iconButtonColors(contentColor = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)) {
+    IconButton(
+        onClick = onClick,
+        colors = IconButtonDefaults.iconButtonColors(
+            contentColor = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+        )
+    ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(icon, null, modifier = Modifier.size(if (isActive) 28.dp else 24.dp))
             if (isActive) Box(Modifier.size(4.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
@@ -506,38 +743,86 @@ fun ModeIcon(icon: ImageVector, isActive: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-fun SongItem(song: Song, isCurrent: Boolean, isSelected: Boolean, themeMode: ThemeMode, themeHue: Float, showArtist: Boolean, onClick: () -> Unit) {
+fun SongItem(
+    song: Song,
+    isCurrent: Boolean,
+    isSelected: Boolean,
+    themeMode: ThemeMode,
+    themeHue: Float,
+    showArtist: Boolean,
+    onClick: () -> Unit
+) {
     val bgColor = when {
         isCurrent -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.8f)
-        isSelected -> Color.hsv(themeHue, if(themeMode == ThemeMode.dark) 0.4f else 0.2f, if(themeMode == ThemeMode.dark) 0.5f else 0.9f)
+        isSelected -> Color.hsv(themeHue, if (themeMode == ThemeMode.dark) 0.4f else 0.2f, if (themeMode == ThemeMode.dark) 0.5f else 0.9f)
         else -> Color.Transparent
     }
     val textColor = if (isSelected && themeMode == ThemeMode.dark) Color.White else MaterialTheme.colorScheme.onBackground
 
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).clip(RoundedCornerShape(12.dp)).background(bgColor).clickable { onClick() }.padding(12.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(bgColor)
+            .clickable { onClick() }
+            .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant), Alignment.Center) {
-            Icon(if (isCurrent && !isSelected) Icons.Default.GraphicEq else Icons.Default.MusicNote, null, tint = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)
+        Box(
+            Modifier
+                .size(48.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            Alignment.Center
+        ) {
+            Icon(
+                if (isCurrent && !isSelected) Icons.Default.GraphicEq else Icons.Default.MusicNote,
+                null,
+                tint = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+            )
         }
         Spacer(Modifier.width(16.dp))
         Column(Modifier.weight(1f)) {
-            Text(song.title, color = textColor, style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                song.title,
+                color = textColor,
+                style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
             if (showArtist) {
-                Text(song.artist, color = if (isSelected) textColor.copy(0.7f) else MaterialTheme.colorScheme.outline, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                Text(
+                    song.artist,
+                    color = if (isSelected) textColor.copy(0.7f) else MaterialTheme.colorScheme.outline,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1
+                )
             }
         }
-        if (isCurrent) Icon(Icons.Default.PlayArrow, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+        if (isCurrent) {
+            Icon(Icons.Default.PlayArrow, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+        }
     }
 }
 
 @Composable
 fun SettingsScreen(
-    themeMode: ThemeMode, themeHue: Float, lang: AppLanguage, showArtist: Boolean, sleepTimerTime: Long,
-    onThemeChange: (ThemeMode) -> Unit, onHueChange: (Float) -> Unit,
-    onLangChange: (AppLanguage) -> Unit, onShowArtistChange: (Boolean) -> Unit,
-    onPickFolder: () -> Unit, onHelp: () -> Unit, onBack: () -> Unit,
+    themeMode: ThemeMode,
+    themeHue: Float,
+    lang: AppLanguage,
+    showArtist: Boolean,
+    sleepTimerTime: Long,
+    syncStatus: String?,
+    isSyncing: Boolean,
+    onThemeChange: (ThemeMode) -> Unit,
+    onHueChange: (Float) -> Unit,
+    onLangChange: (AppLanguage) -> Unit,
+    onShowArtistChange: (Boolean) -> Unit,
+    onPickFolder: () -> Unit,
+    onSync: () -> Unit,
+    onHelp: () -> Unit,
+    onBack: () -> Unit,
     onSetTimer: (Long) -> Unit
 ) {
     var selectedHour by remember { mutableIntStateOf(0) }
@@ -555,12 +840,25 @@ fun SettingsScreen(
         }
     ) { padding ->
         Column(
-            modifier = Modifier.padding(padding).padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())
+            modifier = Modifier
+                .padding(padding)
+                .padding(16.dp)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
         ) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+            // 定时关闭
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Bottom
+            ) {
                 Text(getStr("sleep_timer", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 if (sleepTimerTime > 0) {
-                    Text(getStr("timer_status", lang).format(formatClockTime(sleepTimerTime)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                    Text(
+                        getStr("timer_status", lang).format(formatClockTime(sleepTimerTime)),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -610,53 +908,160 @@ fun SettingsScreen(
             }
 
             Spacer(Modifier.height(24.dp))
+
+            // 外观
             Text(getStr("appearance", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
             Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), tonalElevation = 2.dp) {
                 Column {
-                    Row(modifier = Modifier.fillMaxWidth().clickable { onThemeChange(ThemeMode.light) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(themeMode == ThemeMode.light, { onThemeChange(ThemeMode.light) }); Text(getStr("light_theme", lang)) }
-                    Row(modifier = Modifier.fillMaxWidth().clickable { onThemeChange(ThemeMode.dark) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(themeMode == ThemeMode.dark, { onThemeChange(ThemeMode.dark) }); Text(getStr("dark_theme", lang)) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable { onThemeChange(ThemeMode.light) }.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(themeMode == ThemeMode.light, { onThemeChange(ThemeMode.light) })
+                        Text(getStr("light_theme", lang))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable { onThemeChange(ThemeMode.dark) }.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(themeMode == ThemeMode.dark, { onThemeChange(ThemeMode.dark) })
+                        Text(getStr("dark_theme", lang))
+                    }
                 }
             }
 
             Spacer(Modifier.height(24.dp))
+
+            // 语言
             Text(getStr("language", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
             Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), tonalElevation = 2.dp) {
                 Column {
-                    Row(modifier = Modifier.fillMaxWidth().clickable { onLangChange(AppLanguage.CN) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(lang == AppLanguage.CN, { onLangChange(AppLanguage.CN) }); Text(getStr("lang_cn", lang)) }
-                    Row(modifier = Modifier.fillMaxWidth().clickable { onLangChange(AppLanguage.EN) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(lang == AppLanguage.EN, { onLangChange(AppLanguage.EN) }); Text(getStr("lang_en", lang)) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable { onLangChange(AppLanguage.CN) }.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(lang == AppLanguage.CN, { onLangChange(AppLanguage.CN) })
+                        Text(getStr("lang_cn", lang))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable { onLangChange(AppLanguage.EN) }.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(lang == AppLanguage.EN, { onLangChange(AppLanguage.EN) })
+                        Text(getStr("lang_en", lang))
+                    }
                 }
             }
 
             Spacer(Modifier.height(24.dp))
+
+            // 显示艺术家
             Surface(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp), tonalElevation = 2.dp) {
-                Row(modifier = Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text(getStr("show_artist", lang))
                     Switch(checked = showArtist, onCheckedChange = onShowArtistChange)
                 }
             }
 
             Spacer(Modifier.height(24.dp))
+
+            // 调色板
             Text(getStr("theme_hue", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(12.dp))
             HueSlider(themeHue, lang, onHueChange)
 
             Spacer(Modifier.height(32.dp))
+
+            // 媒体库操作
             Text(getStr("library", lang), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onPickFolder, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Folder, null); Spacer(Modifier.width(8.dp)); Text(getStr("change_folder", lang)) }
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(onClick = onHelp, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.HelpOutline, null); Spacer(Modifier.width(8.dp)); Text(getStr("help", lang)) }
+
+            Button(
+                onClick = onPickFolder,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Folder, null)
+                Spacer(Modifier.width(8.dp))
+                Text(getStr("change_folder", lang))
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // 同步按钮
+            Button(
+                onClick = onSync,
+                enabled = !isSyncing,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                )
+            ) {
+                if (isSyncing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(getStr("sync_button", lang))
+            }
+
+            // 同步状态提示
+            if (syncStatus != null) {
+                Spacer(Modifier.height(8.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (syncStatus!!.contains("失败", ignoreCase = true) || syncStatus!!.contains("failed", ignoreCase = true))
+                            MaterialTheme.colorScheme.errorContainer
+                        else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                    )
+                ) {
+                    Text(
+                        text = syncStatus!!,
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (syncStatus!!.contains("失败", ignoreCase = true) || syncStatus!!.contains("failed", ignoreCase = true))
+                            MaterialTheme.colorScheme.onErrorContainer
+                        else MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // 帮助
+            OutlinedButton(
+                onClick = onHelp,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.HelpOutline, null)
+                Spacer(Modifier.width(8.dp))
+                Text(getStr("help", lang))
+            }
         }
     }
 }
 
+// ---------- 滚轮选择器 ----------
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun WheelPicker(count: Int, initialValue: Int, onValueChange: (Int) -> Unit) {
     val itemHeight = 48.dp
-    val listState = rememberLazyListState(initialFirstVisibleItemIndex = Int.MAX_VALUE / 2 - (Int.MAX_VALUE / 2 % count) + initialValue - 1)
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = Int.MAX_VALUE / 2 - (Int.MAX_VALUE / 2 % count) + initialValue - 1
+    )
     val flingBehavior = rememberSnapFlingBehavior(lazyListState = listState)
 
     LaunchedEffect(listState.isScrollInProgress) {
@@ -666,8 +1071,16 @@ fun WheelPicker(count: Int, initialValue: Int, onValueChange: (Int) -> Unit) {
         }
     }
 
-    Box(modifier = Modifier.width(80.dp).height(itemHeight * 3), contentAlignment = Alignment.Center) {
-        Box(modifier = Modifier.fillMaxWidth().height(itemHeight).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(12.dp)))
+    Box(
+        modifier = Modifier.width(80.dp).height(itemHeight * 3),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(itemHeight)
+                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+        )
         LazyColumn(
             state = listState,
             flingBehavior = flingBehavior,
@@ -676,23 +1089,28 @@ fun WheelPicker(count: Int, initialValue: Int, onValueChange: (Int) -> Unit) {
         ) {
             items(Int.MAX_VALUE) { index ->
                 val value = index % count
-                val offset = remember { derivedStateOf {
-                    val layoutInfo = listState.layoutInfo
-                    val visibleItem = layoutInfo.visibleItemsInfo.find { it.index == index }
-                    if (visibleItem != null) {
-                        val viewCenter = layoutInfo.viewportEndOffset / 2f
-                        val itemCenter = visibleItem.offset + visibleItem.size / 2f
-                        abs(viewCenter - itemCenter) / (layoutInfo.viewportEndOffset / 2f)
-                    } else 1f
-                }}.value
+                val offset = remember {
+                    derivedStateOf {
+                        val layoutInfo = listState.layoutInfo
+                        val visibleItem = layoutInfo.visibleItemsInfo.find { it.index == index }
+                        if (visibleItem != null) {
+                            val viewCenter = layoutInfo.viewportEndOffset / 2f
+                            val itemCenter = visibleItem.offset + visibleItem.size / 2f
+                            abs(viewCenter - itemCenter) / (layoutInfo.viewportEndOffset / 2f)
+                        } else 1f
+                    }
+                }.value
 
                 Box(
-                    modifier = Modifier.fillMaxWidth().height(itemHeight).graphicsLayer {
-                        alpha = 1f - (offset * 0.6f).coerceIn(0f, 0.7f)
-                        scaleX = 1f - (offset * 0.3f).coerceIn(0f, 0.3f)
-                        scaleY = 1f - (offset * 0.3f).coerceIn(0f, 0.3f)
-                        rotationX = offset * 45f
-                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(itemHeight)
+                        .graphicsLayer {
+                            alpha = 1f - (offset * 0.6f).coerceIn(0f, 0.7f)
+                            scaleX = 1f - (offset * 0.3f).coerceIn(0f, 0.3f)
+                            scaleY = 1f - (offset * 0.3f).coerceIn(0f, 0.3f)
+                            rotationX = offset * 45f
+                        },
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
@@ -709,15 +1127,23 @@ fun WheelPicker(count: Int, initialValue: Int, onValueChange: (Int) -> Unit) {
     }
 }
 
+// ---------- 色调滑块 ----------
 @Composable
 fun HueSlider(hue: Float, lang: AppLanguage, onHueChange: (Float) -> Unit) {
     var draggingHue by remember { mutableStateOf<Float?>(null) }
     val dHue = draggingHue ?: hue
     Column {
         BoxWithConstraints(
-            modifier = Modifier.fillMaxWidth().height(44.dp).clip(RoundedCornerShape(22.dp))
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp)
+                .clip(RoundedCornerShape(22.dp))
                 .background(Brush.horizontalGradient(List(36) { Color.hsv(it * 10f, 0.8f, 1f) }))
-                .pointerInput(Unit) { detectTapGestures { onHueChange((it.x / size.width).coerceIn(0f, 1f) * 360f) } }
+                .pointerInput(Unit) {
+                    detectTapGestures {
+                        onHueChange((it.x / size.width).coerceIn(0f, 1f) * 360f)
+                    }
+                }
                 .pointerInput(Unit) {
                     detectDragGestures(
                         onDragStart = { draggingHue = (it.x / size.width).coerceIn(0f, 1f) * 360f },
@@ -733,21 +1159,33 @@ fun HueSlider(hue: Float, lang: AppLanguage, onHueChange: (Float) -> Unit) {
                 }
         ) {
             Box(
-                Modifier.size(44.dp).offset { IntOffset(((dHue / 360f * maxWidth.toPx()) - (44.dp.toPx() / 2)).roundToInt(), 0) }
-                    .background(Color.White, CircleShape).padding(4.dp)
+                Modifier
+                    .size(44.dp)
+                    .offset { IntOffset(((dHue / 360f * maxWidth.toPx()) - (44.dp.toPx() / 2)).roundToInt(), 0) }
+                    .background(Color.White, CircleShape)
+                    .padding(4.dp)
             ) {
                 Box(Modifier.fillMaxSize().background(Color.hsv(dHue, 0.8f, 1f), CircleShape))
             }
         }
-        Text(getStr("hue_hint", lang), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp), color = MaterialTheme.colorScheme.outline)
+        Text(
+            getStr("hue_hint", lang),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(8.dp),
+            color = MaterialTheme.colorScheme.outline
+        )
     }
 }
 
+// ---------- 帮助页面 ----------
 @Composable
 fun HelpScreen(lang: AppLanguage, onBack: () -> Unit) {
     Scaffold(
         topBar = {
-            Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
                 Text(getStr("help", lang), style = MaterialTheme.typography.titleLarge)
             }
@@ -763,15 +1201,26 @@ fun HelpScreen(lang: AppLanguage, onBack: () -> Unit) {
 
 @Composable
 fun HelpCard(title: String, desc: String, icon: ImageVector) {
-    Surface(Modifier.padding(vertical = 8.dp).fillMaxWidth(), RoundedCornerShape(12.dp), tonalElevation = 1.dp) {
-        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+    Surface(
+        Modifier.padding(vertical = 8.dp).fillMaxWidth(),
+        RoundedCornerShape(12.dp),
+        tonalElevation = 1.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(16.dp))
-            Column { Text(title, fontWeight = FontWeight.Bold); Text(desc, color = MaterialTheme.colorScheme.outline) }
+            Column {
+                Text(title, fontWeight = FontWeight.Bold)
+                Text(desc, color = MaterialTheme.colorScheme.outline)
+            }
         }
     }
 }
 
+// ---------- 工具函数 ----------
 fun formatTime(ms: Long): String {
     val total = ms / 1000
     return "%02d:%02d".format(total / 60, total % 60)
